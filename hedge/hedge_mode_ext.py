@@ -893,7 +893,7 @@ class HedgeBot:
             self.logger.error(f"Error handling Extended order book update: {e}")
             self.logger.error(f"Message content: {message}")
 
-    def handle_extended_order_update(self, order_data):
+    async def handle_extended_order_update(self, order_data):
         """Handle Extended order updates from WebSocket."""
         side = order_data.get('side', '').lower()
         filled_size = Decimal(order_data.get('filled_size', '0'))
@@ -1203,15 +1203,17 @@ class HedgeBot:
                         quantity=str(filled_size)
                     )
 
-                    self.handle_extended_order_update({
-                        'order_id': order_id,
-                        'side': side,
-                        'status': status,
-                        'size': size,
-                        'price': price,
-                        'contract_id': self.extended_contract_id,
-                        'filled_size': filled_size
-                    })
+                    asyncio.create_task(
+                        self.handle_extended_order_update({
+                            'order_id': order_id,
+                            'side': side,
+                            'status': status,
+                            'size': size,
+                            'price': price,
+                            'contract_id': self.extended_contract_id,
+                            'filled_size': filled_size
+                        })
+                    )
                 else:
                     if status == 'OPEN':
                         self.logger.info(f"[{order_id}] [{order_type}] [Extended] [{status}]: {size} @ {price}")
