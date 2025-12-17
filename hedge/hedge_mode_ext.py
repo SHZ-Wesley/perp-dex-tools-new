@@ -49,6 +49,7 @@ class HedgeBot:
         soft_unhedged_pos: float = 0.02,
         max_unhedged_pos: float = 0.03,
         max_unhedged_ms: int = 1000,
+
         unwind_trigger_bps: float = -0.3,
         unwind_confirm_count: int = 3,
         unwind_cooldown_ms: int = 5000,
@@ -184,11 +185,7 @@ class HedgeBot:
         self.lighter_order_start_time = None
 
         # Strategy state
-        self.waiting_for_lighter_fill = False
         self.wait_start_time = None
-
-        # Order execution tracking
-        self.order_execution_complete = False
 
         # Current order details for immediate execution
         self.current_lighter_side = None
@@ -301,9 +298,7 @@ class HedgeBot:
                 quantity=str(order_data['filled_base_amount'])
             )
 
-            # Mark execution as complete
-            self.lighter_order_filled = True  # Mark order as filled
-            self.order_execution_complete = True
+            self.lighter_order_filled = True
 
         except Exception as e:
             self.logger.error(f"Error handling Lighter order result: {e}")
@@ -1128,8 +1123,6 @@ class HedgeBot:
                 # Fallback: Mark as filled to continue trading
                 self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
                 self.lighter_order_filled = True
-                self.waiting_for_lighter_fill = False
-                self.order_execution_complete = True
                 break
 
             await asyncio.sleep(0.1)  # Check every 100ms
