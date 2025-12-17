@@ -9,6 +9,7 @@ import requests
 import argparse
 import traceback
 import csv
+import random
 from collections import defaultdict
 from decimal import Decimal
 from typing import Tuple
@@ -87,6 +88,7 @@ class HedgeBot:
         self.unwind_cooldown_until_ms = 0
         self.unwind_edge_bad_count = 0
         self.hedged_qty_by_order = defaultdict(Decimal)
+
         self.hedge_lock = asyncio.Lock()
         self.unwind_lock = asyncio.Lock()
 
@@ -408,6 +410,7 @@ class HedgeBot:
 
     def edge_exit_bps_for_unhedged(self, unhedged_pos: Decimal) -> Decimal:
         mid = self.choose_mid_price()
+
         if unhedged_pos > 0:
             if self.extended_best_bid is None:
                 raise ValueError("Extended best bid missing")
@@ -822,6 +825,8 @@ class HedgeBot:
                     break
                 else:
                     await asyncio.sleep(0.5)
+
+        return True
 
     def handle_extended_order_book_update(self, message):
         """Handle Extended order book updates from WebSocket."""
@@ -1304,187 +1309,53 @@ class HedgeBot:
             self.logger.error(f"Could not setup Extended order book WebSocket: {e}")
 
     async def trading_loop(self):
-        """Main trading loop implementing the new strategy."""
+        """Main trading loop implementing risk-gated Extended entries only."""
         self.logger.info(f"🚀 Starting hedge bot for {self.ticker}")
 
-        # Initialize clients
         try:
             self.initialize_lighter_client()
             self.initialize_extended_client()
-
-            # Get contract info
             self.extended_contract_id, self.extended_tick_size = await self.get_extended_contract_info()
             self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier, self.tick_size = self.get_lighter_market_config()
-
-            self.logger.info(f"Contract info loaded - Extended: {self.extended_contract_id}, "
-                             f"Lighter: {self.lighter_market_index}")
-
-        except Exception as e:
-            self.logger.error(f"❌ Failed to initialize: {e}")
-            return
-
-        # Setup Extended websocket
-        try:
+            self.logger.info(f"Contract info loaded - Extended: {self.extended_contract_id}, Lighter: {self.lighter_market_index}")
             await self.setup_extended_websocket()
-            self.logger.info("✅ Extended WebSocket connection established")
-
-            # Wait for initial order book data with timeout
-            self.logger.info("⏳ Waiting for initial order book data...")
-            timeout = 10  # seconds
-            start_time = time.time()
-            while not self.extended_order_book_ready and not self.stop_flag:
-                if time.time() - start_time > timeout:
-                    self.logger.warning(f"⚠️ Timeout waiting for WebSocket order book data after {timeout}s")
-                    break
-                await asyncio.sleep(0.5)
-
-            if self.extended_order_book_ready:
-                self.logger.info("✅ WebSocket order book data received")
-            else:
-                self.logger.warning("⚠️ WebSocket order book not ready, will use REST API fallback")
-
-        except Exception as e:
-            self.logger.error(f"❌ Failed to setup Extended websocket: {e}")
-            return
-
-        # Setup Lighter websocket
-        try:
             self.lighter_ws_task = asyncio.create_task(self.handle_lighter_ws())
-            self.logger.info("✅ Lighter WebSocket task started")
-
-            # Wait for initial Lighter order book data with timeout
-            self.logger.info("⏳ Waiting for initial Lighter order book data...")
-            timeout = 10  # seconds
-            start_time = time.time()
-            while not self.lighter_order_book_ready and not self.stop_flag:
-                if time.time() - start_time > timeout:
-                    self.logger.warning(f"⚠️ Timeout waiting for Lighter WebSocket order book data after {timeout}s")
-                    break
-                await asyncio.sleep(0.5)
-
-            if self.lighter_order_book_ready:
-                self.logger.info("✅ Lighter WebSocket order book data received")
-            else:
-                self.logger.warning("⚠️ Lighter WebSocket order book not ready")
-
-        except Exception as e:
-            self.logger.error(f"❌ Failed to setup Lighter websocket: {e}")
+        except Exception as exc:
+            self.logger.error(f"❌ Initialization failure: {exc}")
+            self.logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             return
 
-        await asyncio.sleep(5)
+        iteration = 0
+        while not self.stop_flag and iteration < self.iterations:
+            iteration += 1
+            self.logger.info(
+                f"HEARTBEAT iter={iteration}/{self.iterations} ext_pos={self.extended_position} "
+                f"unhedged={self.unhedged_pos} hedged={self.hedged_pos} skip={self.entry_skip_count}"
+            )
 
-        iterations = 0
-        while iterations < self.iterations and not self.stop_flag:
-            iterations += 1
-            self.logger.info("-----------------------------------------------")
-            self.logger.info(f"🔄 Trading loop iteration {iterations}")
-            self.logger.info("-----------------------------------------------")
+            if abs(self.extended_position) >= self.max_extended_position:
+                self.logger.info("RISK_GUARD: extended position at limit, skipping entry")
+                await asyncio.sleep(self.sleep_time or 1)
+                continue
 
-            self.logger.info(f"[STEP 1] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
-
-            if abs(self.extended_position + self.lighter_position) > self.order_quantity*2:
-                self.logger.error(f"❌ Position diff is too large: {self.extended_position + self.lighter_position}")
-                break
-
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
+            side = 'buy' if iteration % 2 == 1 else 'sell'
             try:
-                # Determine side based on some logic (for now, alternate)
-                side = 'buy'
-                await self.place_extended_post_only_order(side, self.order_quantity)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
+                placed = await self.place_extended_post_only_order(side, self.order_quantity)
+            except Exception as exc:
+                self.logger.error(f"⚠️ Error placing Extended order: {exc}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
                 break
 
-            start_time = time.time()
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if Extended order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
+            if not placed:
+                continue
 
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
-
-            if self.stop_flag:
-                break
-
-            # Sleep after step 1
             if self.sleep_time > 0:
-                self.logger.info(f"💤 Sleeping {self.sleep_time} seconds after STEP 1...")
                 await asyncio.sleep(self.sleep_time)
 
-            # Close position
-            self.logger.info(f"[STEP 2] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            try:
-                # Determine side based on some logic (for now, alternate)
-                side = 'sell'
-                await self.place_extended_post_only_order(side, self.order_quantity)
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
-
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if Extended order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
-
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
-
-            # Close remaining position
-            self.logger.info(f"[STEP 3] Extended position: {self.extended_position} | Lighter position: {self.lighter_position}")
-            self.order_execution_complete = False
-            self.waiting_for_lighter_fill = False
-            if self.extended_position == 0:
-                continue
-            elif self.extended_position > 0:
-                side = 'sell'
-            else:
-                side = 'buy'
-
-            try:
-                # Determine side based on some logic (for now, alternate)
-                await self.place_extended_post_only_order(side, abs(self.extended_position))
-            except Exception as e:
-                self.logger.error(f"⚠️ Error in trading loop: {e}")
-                self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
-
-            # Wait for order to be filled via WebSocket
-            while not self.order_execution_complete and not self.stop_flag:
-                # Check if Extended order filled and we need to place Lighter order
-                if self.waiting_for_lighter_fill:
-                    await self.place_lighter_market_order(
-                        self.current_lighter_side,
-                        self.current_lighter_quantity,
-                        self.current_lighter_price
-                    )
-                    break
-
-                await asyncio.sleep(0.01)
-                if time.time() - start_time > 180:
-                    self.logger.error("❌ Timeout waiting for trade completion")
-                    break
+        self.logger.info("✅ Trading loop finished")
 
     async def run(self):
+
         """Run the hedge bot."""
         self.setup_signal_handlers()
 
