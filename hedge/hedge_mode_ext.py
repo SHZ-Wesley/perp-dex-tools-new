@@ -42,6 +42,7 @@ class HedgeBot:
         fill_timeout: int = 5,
         iterations: int = 20,
         sleep_time: int = 0,
+        max_position: Decimal = Decimal('0'),  # Received but maybe unused, kept for compatibility
         entry_bps: float = 2.0,
         exit_good_bps: float = 0.0,
         exit_ok_bps: float = -0.5,
@@ -49,7 +50,13 @@ class HedgeBot:
         soft_unhedged_pos: float = 0.02,
         max_unhedged_pos: float = 0.03,
         max_unhedged_ms: int = 1000,
-
+        
+        # --- New Params ---
+        max_extended_position: Decimal = Decimal('1.0'),
+        entry_skip_sleep_base: float = 1.0,
+        entry_skip_sleep_max: float = 5.0,
+        enable_unwind: bool = False,
+        # ------------------
 
         unwind_trigger_bps: float = -0.3,
         unwind_confirm_count: int = 3,
@@ -76,6 +83,13 @@ class HedgeBot:
         self.soft_unhedged_pos = Decimal(str(soft_unhedged_pos))
         self.max_unhedged_pos = Decimal(str(max_unhedged_pos))
         self.max_unhedged_ms = max_unhedged_ms
+        
+        # Initialize new risk/control parameters
+        self.max_extended_position = max_extended_position
+        self.entry_skip_sleep_base = entry_skip_sleep_base
+        self.entry_skip_sleep_max = entry_skip_sleep_max
+        self.enable_unwind = enable_unwind
+
         self.unwind_trigger_bps = Decimal(str(unwind_trigger_bps))
         self.unwind_confirm_count = unwind_confirm_count
         self.unwind_cooldown_ms = unwind_cooldown_ms
@@ -979,6 +993,8 @@ class HedgeBot:
 
     async def maybe_unwind_hedged_pos(self, source: str):
         async with self.unwind_lock:
+            if not self.enable_unwind:
+                return
             if self.hedged_pos == 0:
                 return
             now_ms = int(time.time() * 1000)
@@ -1326,9 +1342,10 @@ class HedgeBot:
             iteration += 1
             self.logger.info(
                 f"HEARTBEAT iter={iteration}/{self.iterations} ext_pos={self.extended_position} "
-                f"unhedged={self.unhedged_pos} hedged={self.hedged_pos} skip={self.entry_skip_count}"
+                f"unhedged={self.unhedged_pos} hedged={self.hedged_pos}"
             )
 
+            # --- Check Risk Limit ---
             if abs(self.extended_position) >= self.max_extended_position:
                 self.logger.info("RISK_GUARD: extended position at limit, skipping entry")
                 await asyncio.sleep(self.sleep_time or 1)
@@ -1340,9 +1357,16 @@ class HedgeBot:
             except Exception as exc:
                 self.logger.error(f"⚠️ Error placing Extended order: {exc}")
                 self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
-                break
+                # If error is critical, maybe break, else sleep and continue
+                await asyncio.sleep(1)
+                continue
 
+            # --- CRITICAL FIX: Sleep if not placed to avoid instant loop finish ---
             if not placed:
+                # Use dynamic sleep based on configuration
+                sleep_duration = self.entry_skip_sleep_base
+                self.logger.info(f"🚫 Entry skipped, waiting {sleep_duration}s...")
+                await asyncio.sleep(sleep_duration)
                 continue
 
             if self.sleep_time > 0:

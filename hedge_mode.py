@@ -74,6 +74,18 @@ Examples:
                         help='Hard limit for unhedged position (default: 0.03)')
     parser.add_argument('--max-unhedged-ms', type=int, default=1000,
                         help='Max age for unhedged position in ms (default: 1000)')
+    
+    # --- New arguments merged from conflict ---
+    parser.add_argument('--max-extended-position', type=Decimal, default=Decimal('1.0'),
+                        help='Max position on Extended (default: 1.0)')
+    parser.add_argument('--entry-skip-sleep-base', type=float, default=1.0,
+                        help='Base sleep time when entry skipped (default: 1.0)')
+    parser.add_argument('--entry-skip-sleep-max', type=float, default=5.0,
+                        help='Max backoff when entry gate skips (default: 5.0)')
+    parser.add_argument('--enable-unwind', action='store_true',
+                        help='Enable unwinding logic')
+    # ------------------------------------------
+
     parser.add_argument('--unwind-trigger-bps', type=float, default=-0.3,
                         help='Trigger edge for unwind (default: -0.3)')
     parser.add_argument('--unwind-confirm-count', type=int, default=3,
@@ -161,12 +173,16 @@ async def main():
                 max_position=args.max_position
             )
         else:
+            # Extended uses the full parameter set
             bot = HedgeBotClass(
                 ticker=args.ticker.upper(),
                 order_quantity=Decimal(args.size),
                 fill_timeout=args.fill_timeout,
                 iterations=args.iter,
                 sleep_time=args.sleep,
+                max_position=args.max_position,  # Passed for compatibility if needed
+                
+                # Strategy params
                 entry_bps=args.entry_bps,
                 exit_good_bps=args.exit_good_bps,
                 exit_ok_bps=args.exit_ok_bps,
@@ -174,6 +190,14 @@ async def main():
                 soft_unhedged_pos=args.soft_unhedged_pos,
                 max_unhedged_pos=args.max_unhedged_pos,
                 max_unhedged_ms=args.max_unhedged_ms,
+                
+                # --- New params merged from conflict ---
+                max_extended_position=args.max_extended_position,
+                entry_skip_sleep_base=args.entry_skip_sleep_base,
+                entry_skip_sleep_max=args.entry_skip_sleep_max,
+                enable_unwind=args.enable_unwind,
+                # ---------------------------------------
+
                 unwind_trigger_bps=args.unwind_trigger_bps,
                 unwind_confirm_count=args.unwind_confirm_count,
                 unwind_cooldown_ms=args.unwind_cooldown_ms,
