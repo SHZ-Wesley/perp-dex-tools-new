@@ -218,12 +218,12 @@ class ExtendedClient(BaseExchangeClient):
                     return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
                 if direction == 'buy':
-                    # For buy orders, place slightly below best ask to ensure execution
-                    order_price = best_ask - self.config.tick_size
+                    # For buy orders, jump the bid but avoid paying far above the spread
+                    order_price = best_bid + self.config.tick_size
                     side = OrderSide.BUY
                 else:
-                    # For sell orders, place slightly above best bid to ensure execution
-                    order_price = best_bid + self.config.tick_size
+                    # For sell orders, step down from the ask without drifting too low
+                    order_price = best_ask - self.config.tick_size
                     side = OrderSide.SELL
 
                 # Round price to appropriate precision
@@ -288,7 +288,7 @@ class ExtendedClient(BaseExchangeClient):
             except Exception as e:
                 if retry_count < max_retries - 1:
                     retry_count += 1
-                    await asyncio.sleep(0.1)  # Wait before retry
+                    await asyncio.sleep(0.01)  # Wait before retry
                     continue
                 else:
                     return OrderResult(success=False, error_message=str(e))
@@ -406,7 +406,7 @@ class ExtendedClient(BaseExchangeClient):
             except Exception as e:
                 if retry_count < max_retries - 1:
                     retry_count += 1
-                    await asyncio.sleep(0.1)  # Wait before retry
+                    await asyncio.sleep(0.01)  # Wait before retry
                     continue
                 else:
                     return OrderResult(success=False, error_message=str(e))
@@ -431,7 +431,7 @@ class ExtendedClient(BaseExchangeClient):
                 self.logger.log(f"Reverted partially filled size and price: {self.partially_filled_size} and {self.partially_filled_avg_price}", level="INFO")
                 return OrderResult(success=False, error_message='Failed to cancel order')
 
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.01)
             # get order info to know what was the (partially) filled order size
             order_info = await self.get_order_info(order_id)
             min_order_size = self.min_order_size
