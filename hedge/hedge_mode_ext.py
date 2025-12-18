@@ -198,6 +198,9 @@ class HedgeBot:
         self.lighter_ws_task = None
         self.lighter_order_result = None
 
+        # Extended depth websocket task
+        self.extended_depth_task = None
+
         # Lighter order management
         self.lighter_order_status = None
         self.lighter_order_price = None
@@ -323,6 +326,22 @@ class HedgeBot:
                 f"{self.hedged_pos}",
                 age_ms,
             ])
+
+    def handle_task_exception(self, task):
+        """Callback to detect background task failures and stop the bot."""
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self.logger.error(f"Error checking task exception: {exc}")
+            return
+
+        if exception:
+            self.logger.error(f"Background task failed: {exception}")
+            tb = ''.join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+            self.logger.error(f"Full traceback: {tb}")
+            self.stop_flag = True
 
     def handle_lighter_order_result(self, order_data):
         """Handle Lighter order result from WebSocket."""
@@ -743,6 +762,56 @@ class HedgeBot:
 
         self.logger.info("✅ Extended client initialized successfully")
         return self.extended_client
+
+    async def sync_positions(self):
+        """Sync positions from Extended and Lighter to avoid drift after restart."""
+        extended_pos = Decimal("0")
+        lighter_pos = Decimal("0")
+
+        try:
+            if self.extended_client:
+                fetch_position = getattr(self.extended_client, "fetch_position", None)
+                get_account_positions = getattr(self.extended_client, "get_account_positions", None)
+
+                if callable(fetch_position):
+                    extended_pos = await fetch_position(self.extended_contract_id)
+                elif callable(get_account_positions):
+                    try:
+                        extended_pos = await get_account_positions(self.extended_contract_id)
+                    except TypeError:
+                        extended_pos = await get_account_positions()
+                else:
+                    self.logger.warning("No Extended position fetcher available; defaulting to 0")
+        except Exception as exc:
+            self.logger.error(f"Failed to sync Extended position: {exc}")
+
+        try:
+            if self.lighter_client:
+                get_position = getattr(self.lighter_client, "get_position", None)
+                if callable(get_position):
+                    if asyncio.iscoroutinefunction(get_position):
+                        lighter_pos = await get_position(self.lighter_market_index)
+                    else:
+                        lighter_pos = get_position(self.lighter_market_index)
+                else:
+                    self.logger.warning("No Lighter position fetcher available; defaulting to 0")
+        except Exception as exc:
+            self.logger.error(f"Failed to sync Lighter position: {exc}")
+
+        try:
+            self.extended_position = Decimal(str(extended_pos))
+            self.lighter_position = Decimal(str(lighter_pos))
+            hedged_base = min(abs(self.extended_position), abs(self.lighter_position))
+            self.hedged_pos = hedged_base if self.extended_position >= 0 else -hedged_base
+            self.unhedged_pos = self.extended_position + self.lighter_position
+            self.unhedged_since_ms = None if self.unhedged_pos == 0 else int(time.time() * 1000)
+
+            self.logger.info(
+                f"SYNC_POS: extended={self.extended_position} lighter={self.lighter_position} "
+                f"hedged={self.hedged_pos} unhedged={self.unhedged_pos}"
+            )
+        except Exception as exc:
+            self.logger.error(f"Error updating synced positions: {exc}")
 
     def get_lighter_market_config(self) -> Tuple[int, int, int, Decimal]:
         """Get Lighter market configuration."""
@@ -1174,6 +1243,7 @@ class HedgeBot:
                 self.logger.info("HEDGE_MAKER_FILLED")
                 return True
 
+            should_place_taker = True
             try:
                 self.logger.info("HEDGE_CANCEL: cancelling stale maker hedge")
                 cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
@@ -1182,8 +1252,19 @@ class HedgeBot:
                 )
                 if error:
                     self.logger.error(f"HEDGE_CANCEL_ERROR: {error}")
+                    err_lower = str(error).lower()
+                    if "filled" in err_lower or "not found" in err_lower:
+                        should_place_taker = False
             except Exception as exc:
                 self.logger.error(f"HEDGE_CANCEL_EXCEPTION: {exc}")
+
+            if self.lighter_order_filled:
+                self.logger.info("HEDGE_MAKER_FILLED_AFTER_CANCEL_CHECK")
+                return True
+
+            if not should_place_taker:
+                self.logger.info("HEDGE_TAKER_SKIP: cancel indicates order already handled; skipping taker")
+                return False
 
             self.logger.info("HEDGE_TAKER: fallback to taker fill")
             tx_hash = await self.place_lighter_market_order(lighter_side, quantity, Decimal("0"))
@@ -1474,7 +1555,8 @@ class HedgeBot:
                         await asyncio.sleep(2)
 
             # Start depth WebSocket in background
-            asyncio.create_task(handle_depth_websocket())
+            self.extended_depth_task = asyncio.create_task(handle_depth_websocket())
+            self.extended_depth_task.add_done_callback(self.handle_task_exception)
             self.logger.info("✅ Extended order book WebSocket task started")
 
         except Exception as e:
@@ -1492,10 +1574,13 @@ class HedgeBot:
             self.logger.info(f"Contract info loaded - Extended: {self.extended_contract_id}, Lighter: {self.lighter_market_index}")
             await self.setup_extended_websocket()
             self.lighter_ws_task = asyncio.create_task(self.handle_lighter_ws())
+            self.lighter_ws_task.add_done_callback(self.handle_task_exception)
         except Exception as exc:
             self.logger.error(f"❌ Initialization failure: {exc}")
             self.logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             return
+
+        await self.sync_positions()
 
         iteration = 0
         while not self.stop_flag and iteration < self.iterations:
