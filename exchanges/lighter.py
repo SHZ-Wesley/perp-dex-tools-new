@@ -404,29 +404,22 @@ class LighterClient(BaseExchangeClient):
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
         """Get order information from Lighter using official SDK."""
         try:
-            # Use shared API client to get account info
-            account_api = lighter.AccountApi(self.api_client)
+            active_orders = await self.get_active_orders(self.config.contract_id)
+            target_id = str(order_id)
 
-            # Get account orders
-            account_data = await account_api.account(by="index", value=str(self.account_index))
-
-            # Look for the specific order in account positions
-            for position in account_data.positions:
-                if position.symbol == self.config.ticker:
-                    position_amt = abs(float(position.position))
-                    if position_amt > 0.001:  # Only include significant positions
-                        return OrderInfo(
-                            order_id=order_id,
-                            side="buy" if float(position.position) > 0 else "sell",
-                            size=Decimal(str(position_amt)),
-                            price=Decimal(str(position.avg_price)),
-                            status="FILLED",  # Positions are filled orders
-                            filled_size=Decimal(str(position_amt)),
-                            remaining_size=Decimal('0')
-                        )
+            for order in active_orders:
+                if order.order_id == target_id:
+                    return OrderInfo(
+                        order_id=order.order_id,
+                        side=order.side,
+                        size=order.size,
+                        price=order.price,
+                        status="OPEN",
+                        filled_size=order.filled_size,
+                        remaining_size=order.remaining_size,
+                    )
 
             return None
-
         except Exception as e:
             self.logger.log(f"Error getting order info: {e}", "ERROR")
             return None
