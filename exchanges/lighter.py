@@ -464,17 +464,18 @@ class LighterClient(BaseExchangeClient):
             side = "sell" if order.is_ask else "buy"
             size = Decimal(order.initial_base_amount)
             price = Decimal(order.price)
+            remaining_size = Decimal(order.remaining_base_amount)
 
             # Only include orders with remaining size > 0
             if size > 0:
                 contract_orders.append(OrderInfo(
                     order_id=str(order.order_index),
                     side=side,
-                    size=Decimal(order.initial_base_amount),
+                    size=size,
                     price=price,
                     status=order.status.upper(),
                     filled_size=Decimal(order.filled_base_amount),
-                    remaining_size=Decimal(order.remaining_base_amount)
+                    remaining_size=remaining_size
                 ))
 
         return contract_orders
