@@ -1345,6 +1345,7 @@ class HedgeBot:
         best_bid, best_ask = self.get_lighter_best_levels()
         offset = self.ioc_tick_offset
         for attempt in range(self.ioc_max_retries):
+            self.lighter_order_filled = False
             if lighter_side.lower() == "buy":
                 price = best_ask[0] + offset * self.tick_size
             else:
@@ -1375,11 +1376,16 @@ class HedgeBot:
                     tx_type=self.lighter_client.TX_TYPE_CREATE_ORDER,
                     tx_info=tx_info,
                 )
-                return True
+                await self.monitor_lighter_order(client_order_index)
+
+                if self.lighter_order_filled:
+                    return True
+
+                self.logger.warning("IOC attempt did not fill within timeout; retrying")
             except Exception as exc:
                 self.logger.error(f"IOC attempt failed: {exc}")
-                offset += self.ioc_tick_offset
-                await asyncio.sleep(0.05)
+            offset += self.ioc_tick_offset
+            await asyncio.sleep(0.05)
         return False
 
     async def monitor_lighter_order(self, client_order_index: int):
