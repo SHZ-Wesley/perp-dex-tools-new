@@ -42,7 +42,7 @@ class HedgeBot:
         fill_timeout: int = 5,
         iterations: int = 20,
         sleep_time: int = 0,
-        max_position: Decimal = Decimal('0'),  # Received but maybe unused, kept for compatibility
+        max_position: Decimal = Decimal('0'),
         entry_bps: float = 2.0,
         exit_good_bps: float = 0.0,
         exit_ok_bps: float = -0.5,
@@ -967,13 +967,21 @@ class HedgeBot:
             unhedged_before = self.unhedged_pos
             if qty > 0:
                 lighter_side = "sell" if self.unhedged_pos > 0 else "buy"
+                
+                # --- LOGIC FIX: Check return value to prevent fake hedging ---
                 if self.hedge_ioc:
                     success = await self.place_lighter_ioc_progressive(lighter_side, qty)
                     if not success:
                         self.log_event("HEDGE_SKIP", "IOC_FAIL", edge_bps, qty, unhedged_before, self.unhedged_pos, age_ms)
                         return
                 else:
-                    await self.place_lighter_market_order(lighter_side, qty, Decimal("0"))
+                    # Capture tx_hash to verify order submission
+                    tx_hash = await self.place_lighter_market_order(lighter_side, qty, Decimal("0"))
+                    if not tx_hash:
+                         self.logger.error(f"❌ Hedge failed: Lighter order rejected. Qty: {qty}")
+                         self.log_event("HEDGE_FAIL", "API_ERROR", edge_bps, qty, unhedged_before, self.unhedged_pos, age_ms)
+                         return
+                # -----------------------------------------------------------
 
                 if lighter_side == "sell":
                     self.unhedged_pos -= qty
