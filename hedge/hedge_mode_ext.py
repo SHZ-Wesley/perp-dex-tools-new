@@ -197,6 +197,7 @@ class HedgeBot:
         # Lighter WebSocket state
         self.lighter_ws_task = None
         self.lighter_order_result = None
+        self.processed_lighter_orders = set()
 
         # Extended depth websocket task
         self.extended_depth_task = None
@@ -346,6 +347,14 @@ class HedgeBot:
     def handle_lighter_order_result(self, order_data):
         """Handle Lighter order result from WebSocket."""
         try:
+            order_id = order_data.get("order_index") or order_data.get("client_order_index")
+            order_id_str = str(order_id)
+            if order_id_str in self.processed_lighter_orders:
+                return
+            self.processed_lighter_orders.add(order_id_str)
+            if len(self.processed_lighter_orders) > 1000:
+                self.processed_lighter_orders.pop()
+
             order_data["avg_filled_price"] = (Decimal(order_data["filled_quote_amount"]) /
                                               Decimal(order_data["filled_base_amount"]))
             if order_data["is_ask"]:
@@ -1322,7 +1331,11 @@ class HedgeBot:
             self.logger.info(f"🚀 Lighter limit order sent: {lighter_side} {quantity}")
             await self.monitor_lighter_order(client_order_index)
 
-            return tx_hash
+            if self.lighter_order_filled:
+                return tx_hash
+
+            self.logger.error("❌ Lighter market order timed out or failed to fill")
+            return None
         except Exception as e:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
             return None
