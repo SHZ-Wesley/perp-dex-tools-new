@@ -801,8 +801,13 @@ class HedgeBot:
         try:
             self.extended_position = Decimal(str(extended_pos))
             self.lighter_position = Decimal(str(lighter_pos))
-            hedged_base = min(abs(self.extended_position), abs(self.lighter_position))
-            self.hedged_pos = hedged_base if self.extended_position >= 0 else -hedged_base
+
+            hedged_base = Decimal("0")
+            if (self.extended_position > 0 > self.lighter_position) or (self.extended_position < 0 < self.lighter_position):
+                hedged_base = min(abs(self.extended_position), abs(self.lighter_position))
+                hedged_base = hedged_base if self.extended_position > 0 else -hedged_base
+
+            self.hedged_pos = hedged_base
             self.unhedged_pos = self.extended_position + self.lighter_position
             self.unhedged_since_ms = None if self.unhedged_pos == 0 else int(time.time() * 1000)
 
@@ -1135,15 +1140,12 @@ class HedgeBot:
                         self.log_event("HEDGE_FAIL", "API_ERROR", edge_bps, qty, unhedged_before, self.unhedged_pos, age_ms)
                         return
                 # -----------------------------------------------------------
-
                 if lighter_side == "sell":
                     self.unhedged_pos -= qty
-                    if self.unhedged_pos == 0:
-                        self.hedged_pos += qty
+                    self.hedged_pos += qty
                 else:
                     self.unhedged_pos += qty
-                    if self.unhedged_pos == 0:
-                        self.hedged_pos -= qty
+                    self.hedged_pos -= qty
 
                 if self.unhedged_pos == 0:
                     self.unhedged_since_ms = None
@@ -1377,10 +1379,6 @@ class HedgeBot:
             if time.time() - start_time > 30:
                 self.logger.error(f"❌ Timeout waiting for Lighter order fill after {time.time() - start_time:.1f}s")
                 self.logger.error(f"❌ Order state - Filled: {self.lighter_order_filled}")
-
-                # Fallback: Mark as filled to continue trading
-                self.logger.warning("⚠️ Using fallback - marking order as filled to continue trading")
-                self.lighter_order_filled = True
                 break
 
             await asyncio.sleep(0.1)  # Check every 100ms
@@ -1636,6 +1634,32 @@ class HedgeBot:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
             self.logger.info("🔄 Cleaning up...")
+            try:
+                if self.extended_client:
+                    cancel_order_fn = getattr(self.extended_client, "cancel_order", None)
+                    open_orders = getattr(self.extended_client, "open_orders", None)
+
+                    if isinstance(open_orders, dict) and callable(cancel_order_fn):
+                        for order_id in list(open_orders.keys()):
+                            try:
+                                self.logger.info(f"🧹 Cancelling Extended open order {order_id} before shutdown")
+                                await cancel_order_fn(order_id)
+                            except Exception as exc:
+                                self.logger.error(f"Error cancelling Extended order {order_id}: {exc}")
+                    elif callable(cancel_order_fn):
+                        self.logger.info("🧹 Attempting to cancel outstanding Extended orders before shutdown")
+                        try:
+                            active_orders = await self.extended_client.get_active_orders(self.extended_contract_id)
+                            for order in active_orders:
+                                try:
+                                    self.logger.info(f"🧹 Cancelling Extended open order {order.order_id} before shutdown")
+                                    await cancel_order_fn(order.order_id)
+                                except Exception as exc:
+                                    self.logger.error(f"Error cancelling Extended order {order.order_id}: {exc}")
+                        except Exception as exc:
+                            self.logger.error(f"Error fetching active Extended orders for cleanup: {exc}")
+            except Exception as exc:
+                self.logger.error(f"Error during Extended cleanup: {exc}")
             await self.close_clients()
             self.shutdown()
 
