@@ -1026,19 +1026,22 @@ class HedgeBot:
 
             unwind_qty = abs(self.hedged_pos)
             extended_side = "sell" if self.hedged_pos > 0 else "buy"
-            lighter_side = "buy" if self.hedged_pos > 0 else "sell"
+            
+            self.logger.info(f"🔄 UNWIND TRIGGERED: Closing {unwind_qty} on Extended via Maker order")
 
             try:
+                # 1. Place Extended order and wait for fill
+                # Websocket handler (handle_extended_order_update) will see the fill,
+                # update unhedged_pos, and trigger maybe_hedge_unhedged_pos to close the Lighter side.
                 await self.place_bbo_order(extended_side, unwind_qty)
-                if self.hedge_ioc:
-                    await self.place_lighter_ioc_progressive(lighter_side, unwind_qty)
-                else:
-                    await self.place_lighter_market_order(lighter_side, unwind_qty, Decimal("0"))
+            except Exception as e:
+                self.logger.error(f"❌ Unwind failed on Extended side: {e}")
             finally:
-                self.hedged_pos = Decimal("0")
+                # 2. Do NOT manually reset hedged_pos or place Lighter orders here.
+                # Rely on the closed-loop feedback from websocket.
                 self.unwind_cooldown_until_ms = now_ms + self.unwind_cooldown_ms
                 self.unwind_edge_bad_count = 0
-                self.log_event("UNWIND", "UNWIND_EDGE_BAD", edge_bps, unwind_qty, self.unhedged_pos, self.unhedged_pos, 0)
+                self.log_event("UNWIND_REQ", "Sent Extended Close", edge_bps, unwind_qty, self.unhedged_pos, self.unhedged_pos, 0)
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:

@@ -75,7 +75,7 @@ Examples:
     parser.add_argument('--max-unhedged-ms', type=int, default=1000,
                         help='Max age for unhedged position in ms (default: 1000)')
     
-    # --- New arguments merged from conflict ---
+    # --- New arguments ---
     parser.add_argument('--max-extended-position', type=Decimal, default=Decimal('1.0'),
                         help='Max position on Extended (default: 1.0)')
     parser.add_argument('--entry-skip-sleep-base', type=float, default=1.0,
@@ -84,8 +84,7 @@ Examples:
                         help='Max backoff when entry gate skips (default: 5.0)')
     parser.add_argument('--enable-unwind', action='store_true',
                         help='Enable unwinding logic')
-    # ------------------------------------------
-
+    
     parser.add_argument('--unwind-trigger-bps', type=float, default=-0.3,
                         help='Trigger edge for unwind (default: -0.3)')
     parser.add_argument('--unwind-confirm-count', type=int, default=3,
@@ -191,12 +190,11 @@ async def main():
                 max_unhedged_pos=args.max_unhedged_pos,
                 max_unhedged_ms=args.max_unhedged_ms,
                 
-                # --- New params merged from conflict ---
+                # --- New params ---
                 max_extended_position=args.max_extended_position,
                 entry_skip_sleep_base=args.entry_skip_sleep_base,
                 entry_skip_sleep_max=args.entry_skip_sleep_max,
                 enable_unwind=args.enable_unwind,
-                # ---------------------------------------
 
                 unwind_trigger_bps=args.unwind_trigger_bps,
                 unwind_confirm_count=args.unwind_confirm_count,
