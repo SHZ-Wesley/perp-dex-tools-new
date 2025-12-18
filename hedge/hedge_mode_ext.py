@@ -64,6 +64,8 @@ class HedgeBot:
         hedge_ioc: bool = False,
         ioc_tick_offset: int = 2,
         ioc_max_retries: int = 3,
+        max_bbo_staleness_ms: int = 1500,
+        min_profit_bps: float = 0.1,
     ):
         self.ticker = ticker
         self.order_quantity = order_quantity
@@ -96,6 +98,8 @@ class HedgeBot:
         self.hedge_ioc = hedge_ioc
         self.ioc_tick_offset = Decimal(str(ioc_tick_offset))
         self.ioc_max_retries = ioc_max_retries
+        self.max_bbo_staleness_ms = max_bbo_staleness_ms
+        self.min_profit_bps = Decimal(str(min_profit_bps))
 
         # Position state
         self.unhedged_pos = Decimal("0")
@@ -176,6 +180,7 @@ class HedgeBot:
         self.extended_best_bid = None
         self.extended_best_ask = None
         self.extended_order_book_ready = False
+        self.extended_order_book_ts = 0
 
         # Lighter order book state
         self.lighter_client = None
@@ -187,6 +192,7 @@ class HedgeBot:
         self.lighter_order_book_sequence_gap = False
         self.lighter_snapshot_loaded = False
         self.lighter_order_book_lock = asyncio.Lock()
+        self.lighter_order_book_ts = 0
 
         # Lighter WebSocket state
         self.lighter_ws_task = None
@@ -246,6 +252,34 @@ class HedgeBot:
             try:
                 handler.close()
                 self.logger.removeHandler(handler)
+            except Exception:
+                pass
+
+    async def close_clients(self):
+        if self.lighter_ws_task and not self.lighter_ws_task.done():
+            self.lighter_ws_task.cancel()
+            try:
+                await self.lighter_ws_task
+            except asyncio.CancelledError:
+                pass
+
+        if self.extended_client and hasattr(self.extended_client, "disconnect"):
+            try:
+                await self.extended_client.disconnect()
+            except Exception as exc:
+                self.logger.error(f"Error disconnecting Extended client: {exc}")
+
+        if self.lighter_client:
+            try:
+                close_fn = getattr(self.lighter_client, "close", None)
+                if callable(close_fn):
+                    await close_fn()
+            except Exception as exc:
+                self.logger.error(f"Error closing Lighter client: {exc}")
+            try:
+                session = getattr(self.lighter_client, "session", None)
+                if session:
+                    await session.close()
             except Exception:
                 pass
 
@@ -389,7 +423,7 @@ class HedgeBot:
         best_bid, best_ask = self.get_lighter_best_levels()
 
         if best_bid is None or best_ask is None:
-            raise Exception("Cannot calculate mid price - missing order book data")
+            return None
 
         mid_price = (best_bid[0] + best_ask[0]) / Decimal('2')
         return mid_price
@@ -398,7 +432,9 @@ class HedgeBot:
         """Choose a mid price from available books."""
         candidates = []
         try:
-            candidates.append(self.get_lighter_mid_price())
+            mid_price = self.get_lighter_mid_price()
+            if mid_price is not None:
+                candidates.append(mid_price)
         except Exception:
             pass
 
@@ -406,38 +442,59 @@ class HedgeBot:
             candidates.append((self.extended_best_bid + self.extended_best_ask) / Decimal('2'))
 
         if not candidates:
-            raise ValueError("No mid price available")
+            return None
 
         return sum(candidates) / Decimal(len(candidates))
 
+    def is_book_fresh(self, ready: bool, last_ts: int) -> bool:
+        now_ms = int(time.time() * 1000)
+        return ready and (now_ms - last_ts) <= self.max_bbo_staleness_ms
+
+    def _safe_edge(self, numerator: Decimal, mid: Decimal) -> Decimal:
+        if mid is None or mid <= 0:
+            return None
+        if numerator is None:
+            return None
+        edge = numerator / mid * Decimal("1e4")
+        if edge == 0:
+            return None
+        if abs(edge) > Decimal("1e6"):
+            return None
+        if abs(edge) < self.min_profit_bps:
+            return None
+        return edge
+
     def edge_entry_bps(self, side: str, extended_post_price: Decimal) -> Decimal:
         mid = self.choose_mid_price()
+        if mid is None or extended_post_price is None:
+            return None
         if side.lower() == "buy":
-            edge = (self.lighter_best_bid - extended_post_price) / mid * Decimal("1e4")
+            numerator = self.lighter_best_bid - extended_post_price if self.lighter_best_bid else None
         else:
-            edge = (extended_post_price - self.lighter_best_ask) / mid * Decimal("1e4")
-        return edge
+            numerator = extended_post_price - self.lighter_best_ask if self.lighter_best_ask else None
+        return self._safe_edge(numerator, mid)
 
     def edge_exit_bps_for_unhedged(self, unhedged_pos: Decimal) -> Decimal:
         mid = self.choose_mid_price()
 
         if unhedged_pos > 0:
-            if self.extended_best_bid is None:
-                raise ValueError("Extended best bid missing")
-            edge = (self.extended_best_bid - self.lighter_best_ask) / mid * Decimal("1e4")
+            numerator = None
+            if self.extended_best_bid and self.lighter_best_bid:
+                numerator = self.extended_best_bid - self.lighter_best_bid
         else:
-            if self.extended_best_ask is None:
-                raise ValueError("Extended best ask missing")
-            edge = (self.lighter_best_bid - self.extended_best_ask) / mid * Decimal("1e4")
-        return edge
+            numerator = None
+            if self.extended_best_ask and self.lighter_best_ask:
+                numerator = self.lighter_best_ask - self.extended_best_ask
+        return self._safe_edge(numerator, mid)
 
     def exit_edge_bps_for_unwind(self) -> Decimal:
         mid = self.choose_mid_price()
-        if self.hedged_pos > 0:
-            edge = (self.extended_best_bid - self.lighter_best_ask) / mid * Decimal("1e4")
-        else:
-            edge = (self.lighter_best_bid - self.extended_best_ask) / mid * Decimal("1e4")
-        return edge
+        numerator = None
+        if self.hedged_pos > 0 and self.extended_best_bid and self.lighter_best_ask:
+            numerator = self.extended_best_bid - self.lighter_best_ask
+        elif self.hedged_pos < 0 and self.lighter_best_bid and self.extended_best_ask:
+            numerator = self.lighter_best_bid - self.extended_best_ask
+        return self._safe_edge(numerator, mid)
 
     def get_lighter_order_price(self, is_ask: bool) -> Decimal:
         """Get order price from Lighter order book."""
@@ -542,6 +599,13 @@ class HedgeBot:
                                     self.lighter_snapshot_loaded = True
                                     self.lighter_order_book_ready = True
 
+                                    best_bid, best_ask = self.get_lighter_best_levels()
+                                    if best_bid:
+                                        self.lighter_best_bid = best_bid[0]
+                                    if best_ask:
+                                        self.lighter_best_ask = best_ask[0]
+                                    self.lighter_order_book_ts = int(time.time() * 1000)
+
                                     self.logger.info(f"✅ Lighter order book snapshot loaded with "
                                                      f"{len(self.lighter_order_book['bids'])} bids and "
                                                      f"{len(self.lighter_order_book['asks'])} asks")
@@ -577,6 +641,7 @@ class HedgeBot:
                                         self.lighter_best_bid = best_bid[0]
                                     if best_ask is not None:
                                         self.lighter_best_ask = best_ask[0]
+                                    self.lighter_order_book_ts = int(time.time() * 1000)
 
                                     asyncio.create_task(self.maybe_hedge_unhedged_pos(reason="L2_UPDATE"))
                                     asyncio.create_task(self.maybe_unwind_hedged_pos(source="L2_UPDATE"))
@@ -774,10 +839,20 @@ class HedgeBot:
             self.log_event("ENTRY_SKIP", "COOLDOWN_SKIP", Decimal("0"), Decimal("0"), self.unhedged_pos, self.unhedged_pos, 0)
             return
 
+        if not (self.is_book_fresh(self.extended_order_book_ready, self.extended_order_book_ts) and
+                self.is_book_fresh(self.lighter_order_book_ready, self.lighter_order_book_ts)):
+            self.logger.info("DATA_NOT_READY_SKIP: stale BBO for entry")
+            self.log_event("ENTRY_SKIP", "DATA_NOT_READY_SKIP", Decimal("0"), Decimal("0"), self.unhedged_pos, self.unhedged_pos, 0)
+            return
+
         # Determine tentative post price using current best quotes
         best_bid, best_ask = await self.fetch_extended_bbo_prices()
         post_price = best_bid if side == "buy" else best_ask
         edge_bps = self.edge_entry_bps(side, post_price)
+        if edge_bps is None:
+            self.logger.info("EDGE_INVALID_SKIP: cannot compute entry edge")
+            self.log_event("ENTRY_SKIP", "EDGE_INVALID_SKIP", Decimal("0"), Decimal("0"), self.unhedged_pos, self.unhedged_pos, 0)
+            return
         if edge_bps < self.entry_bps:
             self.logger.info(f"ENTRY_GATE_SKIP: edge {edge_bps:.4f} < entry_bps {self.entry_bps}")
             self.log_event("ENTRY_SKIP", "ENTRY_GATE_SKIP", edge_bps, Decimal("0"), self.unhedged_pos, self.unhedged_pos, 0)
@@ -895,6 +970,7 @@ class HedgeBot:
                         self.extended_best_bid = max(self.extended_order_book['bids'].keys())
                     if self.extended_order_book['asks']:
                         self.extended_best_ask = min(self.extended_order_book['asks'].keys())
+                    self.extended_order_book_ts = int(time.time() * 1000)
 
                     if not self.extended_order_book_ready:
                         self.extended_order_book_ready = True
@@ -945,6 +1021,10 @@ class HedgeBot:
                 self.logger.error(f"Hedge edge calc failed: {exc}")
                 return
 
+            if edge_bps is None:
+                self.logger.info("EDGE_INVALID_SKIP: hedge edge missing")
+                return
+
             qty = Decimal("0")
             reason_code = reason
             if edge_bps >= self.exit_good_bps:
@@ -967,7 +1047,7 @@ class HedgeBot:
             unhedged_before = self.unhedged_pos
             if qty > 0:
                 lighter_side = "sell" if self.unhedged_pos > 0 else "buy"
-                
+
                 # --- LOGIC FIX: Check return value to prevent fake hedging ---
                 if self.hedge_ioc:
                     success = await self.place_lighter_ioc_progressive(lighter_side, qty)
@@ -975,12 +1055,11 @@ class HedgeBot:
                         self.log_event("HEDGE_SKIP", "IOC_FAIL", edge_bps, qty, unhedged_before, self.unhedged_pos, age_ms)
                         return
                 else:
-                    # Capture tx_hash to verify order submission
-                    tx_hash = await self.place_lighter_market_order(lighter_side, qty, Decimal("0"))
-                    if not tx_hash:
-                         self.logger.error(f"❌ Hedge failed: Lighter order rejected. Qty: {qty}")
-                         self.log_event("HEDGE_FAIL", "API_ERROR", edge_bps, qty, unhedged_before, self.unhedged_pos, age_ms)
-                         return
+                    success = await self.hedge_unhedged_on_lighter(lighter_side, qty)
+                    if not success:
+                        self.logger.error(f"❌ Hedge failed: Lighter order rejected. Qty: {qty}")
+                        self.log_event("HEDGE_FAIL", "API_ERROR", edge_bps, qty, unhedged_before, self.unhedged_pos, age_ms)
+                        return
                 # -----------------------------------------------------------
 
                 if lighter_side == "sell":
@@ -1042,6 +1121,71 @@ class HedgeBot:
                 self.unwind_cooldown_until_ms = now_ms + self.unwind_cooldown_ms
                 self.unwind_edge_bad_count = 0
                 self.log_event("UNWIND_REQ", "Sent Extended Close", edge_bps, unwind_qty, self.unhedged_pos, self.unhedged_pos, 0)
+
+    async def hedge_unhedged_on_lighter(self, lighter_side: str, quantity: Decimal) -> bool:
+        if not self.lighter_client:
+            await self.initialize_lighter_client()
+
+        best_bid, best_ask = self.get_lighter_best_levels()
+        if best_bid is None or best_ask is None:
+            self.logger.info("EDGE_INVALID_SKIP: missing Lighter book for hedge")
+            return False
+
+        is_ask = lighter_side.lower() == "sell"
+        post_price = best_ask[0] if is_ask else best_bid[0]
+
+        client_order_index = int(time.time() * 1000)
+        self.lighter_order_filled = False
+        self.lighter_order_price = post_price
+        self.lighter_order_side = lighter_side
+        self.lighter_order_size = quantity
+        self.logger.info(f"HEDGE_MAKER_START: {lighter_side} {quantity} @ {post_price}")
+
+        try:
+            tx_info, error = self.lighter_client.sign_create_order(
+                market_index=self.lighter_market_index,
+                client_order_index=client_order_index,
+                base_amount=int(quantity * self.base_amount_multiplier),
+                price=int(post_price * self.price_multiplier),
+                is_ask=is_ask,
+                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
+                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                reduce_only=False,
+                trigger_price=0,
+            )
+            if error is not None:
+                raise Exception(error)
+
+            await self.lighter_client.send_tx(
+                tx_type=self.lighter_client.TX_TYPE_CREATE_ORDER,
+                tx_info=tx_info,
+            )
+
+            start_time = time.time()
+            while not self.lighter_order_filled and (time.time() - start_time) < self.fill_timeout and not self.stop_flag:
+                await asyncio.sleep(0.1)
+
+            if self.lighter_order_filled:
+                self.logger.info("HEDGE_MAKER_FILLED")
+                return True
+
+            try:
+                self.logger.info("HEDGE_CANCEL: cancelling stale maker hedge")
+                cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
+                    market_index=self.lighter_market_index,
+                    order_index=client_order_index,
+                )
+                if error:
+                    self.logger.error(f"HEDGE_CANCEL_ERROR: {error}")
+            except Exception as exc:
+                self.logger.error(f"HEDGE_CANCEL_EXCEPTION: {exc}")
+
+            self.logger.info("HEDGE_TAKER: fallback to taker fill")
+            tx_hash = await self.place_lighter_market_order(lighter_side, quantity, Decimal("0"))
+            return tx_hash is not None
+        except Exception as exc:
+            self.logger.error(f"HEDGE_ERROR: {exc}")
+            return False
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal, price: Decimal):
         if not self.lighter_client:
@@ -1356,6 +1500,12 @@ class HedgeBot:
                 f"unhedged={self.unhedged_pos} hedged={self.hedged_pos}"
             )
 
+            if self.unhedged_pos != 0:
+                self.logger.info("HEDGE_LOOP: unhedged detected, hedging before entry")
+                await self.maybe_hedge_unhedged_pos(reason="LOOP")
+                await asyncio.sleep(self.sleep_time or 0.1)
+                continue
+
             # --- Check Risk Limit ---
             if abs(self.extended_position) >= self.max_extended_position:
                 self.logger.info("RISK_GUARD: extended position at limit, skipping entry")
@@ -1396,6 +1546,7 @@ class HedgeBot:
             self.logger.info("\n🛑 Received interrupt signal...")
         finally:
             self.logger.info("🔄 Cleaning up...")
+            await self.close_clients()
             self.shutdown()
 
 
