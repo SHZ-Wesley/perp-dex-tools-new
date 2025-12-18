@@ -218,12 +218,12 @@ class ExtendedClient(BaseExchangeClient):
                     return OrderResult(success=False, error_message='Invalid bid/ask prices')
 
                 if direction == 'buy':
-                    # For buy orders, jump the bid but avoid paying far above the spread
-                    order_price = best_bid + self.config.tick_size
+                    # For buy orders, stay on the bid to honor post-only
+                    order_price = best_bid
                     side = OrderSide.BUY
                 else:
-                    # For sell orders, step down from the ask without drifting too low
-                    order_price = best_ask - self.config.tick_size
+                    # For sell orders, stay on the ask to honor post-only
+                    order_price = best_ask
                     side = OrderSide.SELL
 
                 # Round price to appropriate precision
@@ -761,11 +761,11 @@ class ExtendedClient(BaseExchangeClient):
 
         tick_size = self.config.tick_size
         if direction == 'buy':
-            # For buy orders, place slightly below best ask to ensure execution
-            order_price = best_ask - tick_size
+            # For buy orders, rest on the current bid to remain maker
+            order_price = best_bid
         else:
-            # For sell orders, place slightly above best bid to ensure execution
-            order_price = best_bid + tick_size
+            # For sell orders, rest on the current ask to remain maker
+            order_price = best_ask
         return self.round_to_tick(order_price)
 
     

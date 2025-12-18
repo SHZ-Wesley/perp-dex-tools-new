@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Tuple
 
 from lighter.signer_client import SignerClient
+from lighter import ApiClient as LighterApiClient, Configuration as LighterConfiguration, OrderApi
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,7 +44,7 @@ class HedgeBot:
         iterations: int = 20,
         sleep_time: int = 0,
         max_position: Decimal = Decimal('0'),
-        entry_bps: float = 2.0,
+        entry_bps: float = 15.0,
         exit_good_bps: float = 0.0,
         exit_ok_bps: float = -0.5,
         exit_bad_bps: float = -1.0,
@@ -1207,6 +1208,43 @@ class HedgeBot:
                 self.unwind_edge_bad_count = 0
                 self.log_event("UNWIND_REQ", "Sent Extended Close", edge_bps, unwind_qty, self.unhedged_pos, self.unhedged_pos, 0)
 
+    async def get_lighter_order_status(self, order_index: int) -> str:
+        """Fetch order status from Lighter; returns CANCELED, FILLED, OPEN, or UNKNOWN."""
+        if not self.lighter_client:
+            await self.initialize_lighter_client()
+
+        api_client = None
+        try:
+            auth_token, error = self.lighter_client.create_auth_token_with_expiry()
+            if error is not None:
+                self.logger.error(f"HEDGE_STATUS_AUTH_ERROR: {error}")
+                return "UNKNOWN"
+
+            api_client = LighterApiClient(configuration=LighterConfiguration(host=self.lighter_base_url))
+            order_api = OrderApi(api_client)
+            inactive_orders = await order_api.account_inactive_orders(
+                account_index=self.account_index,
+                market_id=self.lighter_market_index,
+                auth=auth_token,
+            )
+
+            target_id = str(order_index)
+            for order in getattr(inactive_orders, "orders", []) or []:
+                order_id = str(getattr(order, "order_index", getattr(order, "orderId", "")))
+                if order_id == target_id:
+                    return getattr(order, "status", "UNKNOWN").upper()
+
+            return "UNKNOWN"
+        except Exception as exc:
+            self.logger.error(f"HEDGE_STATUS_CHECK_ERROR: {exc}")
+            return "UNKNOWN"
+        finally:
+            try:
+                if api_client:
+                    await api_client.close()
+            except Exception:
+                pass
+
     async def hedge_unhedged_on_lighter(self, lighter_side: str, quantity: Decimal) -> bool:
         if not self.lighter_client:
             await self.initialize_lighter_client()
@@ -1254,7 +1292,8 @@ class HedgeBot:
                 self.logger.info("HEDGE_MAKER_FILLED")
                 return True
 
-            should_place_taker = True
+            should_place_taker = False
+            cancel_confirmed = False
             try:
                 self.logger.info("HEDGE_CANCEL: cancelling stale maker hedge")
                 cancel_order, tx_hash, error = await self.lighter_client.cancel_order(
@@ -1265,13 +1304,29 @@ class HedgeBot:
                     self.logger.error(f"HEDGE_CANCEL_ERROR: {error}")
                     err_lower = str(error).lower()
                     if "filled" in err_lower or "not found" in err_lower:
-                        should_place_taker = False
+                        cancel_confirmed = False
+                    else:
+                        order_status = await self.get_lighter_order_status(client_order_index)
+                        if order_status == "CANCELED":
+                            cancel_confirmed = True
+                        elif order_status == "FILLED" or order_status == "UNKNOWN":
+                            cancel_confirmed = False
+                else:
+                    cancel_confirmed = True
             except Exception as exc:
                 self.logger.error(f"HEDGE_CANCEL_EXCEPTION: {exc}")
+                order_status = await self.get_lighter_order_status(client_order_index)
+                if order_status == "CANCELED":
+                    cancel_confirmed = True
+                elif order_status == "FILLED" or order_status == "UNKNOWN":
+                    cancel_confirmed = False
 
             if self.lighter_order_filled:
                 self.logger.info("HEDGE_MAKER_FILLED_AFTER_CANCEL_CHECK")
                 return True
+
+            if cancel_confirmed:
+                should_place_taker = True
 
             if not should_place_taker:
                 self.logger.info("HEDGE_TAKER_SKIP: cancel indicates order already handled; skipping taker")
@@ -1698,5 +1753,29 @@ def parse_arguments():
                         help='Timeout in seconds for maker order fills (default: 2)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
+    parser.add_argument('--entry-bps', type=float, default=15.0,
+                        help='Minimum entry edge in basis points (default: 15.0)')
 
     return parser.parse_args()
+
+
+if __name__ == "__main__":
+    try:
+        args = parse_arguments()
+        if args.size is None or args.iter is None:
+            print("❌ Error: --size and --iter arguments are required.")
+            sys.exit(1)
+
+        bot = HedgeBot(
+            ticker=args.ticker,
+            order_quantity=Decimal(args.size),
+            fill_timeout=args.fill_timeout,
+            iterations=args.iter,
+            sleep_time=args.sleep,
+            entry_bps=args.entry_bps,
+        )
+
+        asyncio.run(bot.run())
+    except Exception as exc:
+        print(f"Error running HedgeBot: {exc}")
+        traceback.print_exc()
