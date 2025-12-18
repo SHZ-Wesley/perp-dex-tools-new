@@ -39,7 +39,7 @@ class HedgeBot:
         self,
         ticker: str,
         order_quantity: Decimal,
-        fill_timeout: int = 5,
+        fill_timeout: int = 2,
         iterations: int = 20,
         sleep_time: int = 0,
         max_position: Decimal = Decimal('0'),
@@ -1021,28 +1021,33 @@ class HedgeBot:
                 self.logger.error(f"Hedge edge calc failed: {exc}")
                 return
 
-            if edge_bps is None:
-                self.logger.info("EDGE_INVALID_SKIP: hedge edge missing")
-                return
-
             qty = Decimal("0")
             reason_code = reason
-            if edge_bps >= self.exit_good_bps:
-                qty = abs_pos
-                reason_code = "GOOD_EDGE"
-            elif edge_bps >= self.exit_ok_bps:
-                qty = max(Decimal("0"), abs_pos - self.soft_unhedged_pos)
-                reason_code = "OK_EDGE"
-            else:
-                if abs_pos > self.max_unhedged_pos:
-                    qty = abs_pos - self.max_unhedged_pos
-                    reason_code = "HARD_LIMIT"
-                elif age_ms > self.max_unhedged_ms:
-                    qty = max(Decimal("0"), abs_pos - self.soft_unhedged_pos)
-                    reason_code = "TIMEOUT"
+            if edge_bps is None:
+                if age_ms > 30000:
+                    self.logger.warning("🚨 EMERGENCY: Data unavailable for 30s, forcing market close!")
+                    qty = abs_pos
+                    reason_code = "EMERGENCY_TIMEOUT"
                 else:
-                    qty = Decimal("0")
-                    reason_code = "WAIT"
+                    self.logger.info("EDGE_INVALID_SKIP: hedge edge missing")
+                    return
+            else:
+                if edge_bps >= self.exit_good_bps:
+                    qty = abs_pos
+                    reason_code = "GOOD_EDGE"
+                elif edge_bps >= self.exit_ok_bps:
+                    qty = max(Decimal("0"), abs_pos - self.soft_unhedged_pos)
+                    reason_code = "OK_EDGE"
+                else:
+                    if abs_pos > self.max_unhedged_pos:
+                        qty = abs_pos - self.max_unhedged_pos
+                        reason_code = "HARD_LIMIT"
+                    elif age_ms > self.max_unhedged_ms:
+                        qty = max(Decimal("0"), abs_pos - self.soft_unhedged_pos)
+                        reason_code = "TIMEOUT"
+                    else:
+                        qty = Decimal("0")
+                        reason_code = "WAIT"
 
             unhedged_before = self.unhedged_pos
             if qty > 0:
@@ -1561,8 +1566,8 @@ def parse_arguments():
                         help='Number of tokens to buy/sell per order')
     parser.add_argument('--iter', type=int,
                         help='Number of iterations to run')
-    parser.add_argument('--fill-timeout', type=int, default=5,
-                        help='Timeout in seconds for maker order fills (default: 5)')
+    parser.add_argument('--fill-timeout', type=int, default=2,
+                        help='Timeout in seconds for maker order fills (default: 2)')
     parser.add_argument('--sleep', type=int, default=0,
                         help='Sleep time in seconds after each step (default: 0)')
 
